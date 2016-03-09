@@ -1,0 +1,26 @@
+# Sample specfile for the "layout" utility demonstrating all features
+
+output  :name => "myfile.bin",   # Output file will be named "myfile.bin"
+        :size => 2 * MiB,        # Output file will be 2 MiB long
+        :fill => 0xff            # Output will be pre-filled with 0xff bytes (think memset)
+
+layout {
+    # Place "bootloader.bin" at the beginning of the image
+    component   'bootloader.bin', 0 * B      , 256 * B
+
+    # Document some unused buffer space
+    reserved                      256 * B    , 256 * B
+
+    # Firmware code runs from offset 512 to the 1 MiB boundary, and needs a checksum
+    component   'firmware.bin',   512 * B    , 1 * MiB - 512 * B, {:checksum => true}
+
+    # Write a header before the data section
+    setbyte     0x100000, 0xAA
+    setbyte     0x100001, 0x55
+
+    # Insert static data
+    component   'sdata.hex',      0x100002   , 64 * KiB
+
+    # Place a checksum over the entire image
+    checksum   0, 2 * MiB
+}

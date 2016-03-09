@@ -1,0 +1,12 @@
+# A simple spec file for the "layout" utility
+
+output  :name => "myfile.bin",
+        :size => 2 * KiB
+
+layout {
+    # Place "bootloader.bin" at the beginning of the image
+    component   'bootloader.bin', 0, 256 * B
+
+    # Place the file "data.bin" at offset 256
+    component   'data.bin', 256, 1 * KiB
+}
