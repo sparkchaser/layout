@@ -1,0 +1,278 @@
+#!/usr/bin/ruby
+# Utility for laying out binary files using specification files
+# that are easy for humans to read, write, and maintain.
+
+# Copyright 2016 Ben Allen
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+require 'optparse'
+
+$debug = false
+
+###############
+# Error codes
+###############
+$err_cli        = 1  # error in command-line arguments
+$err_syntax     = 2  # syntax error in spec file
+$err_io         = 3  # file I/O error
+$err_generic    = 10 # generic error code
+
+
+###############
+# Constants
+###############
+B   = 1
+KiB = 1024 ** 1
+MiB = 1024 ** 2
+GiB = 1024 ** 3
+KB  = 1000 ** 1
+MB  = 1000 ** 2
+GB  = 1000 ** 3
+
+
+###############
+# Helpers
+###############
+
+# Helper function for killing the program with an error message
+def errout(message, code=$err_generic)
+    STDERR.puts "Error: " + message
+    if code == $err_cli
+        usage
+    end
+    Kernel.exit code
+end
+
+# Print program usage information
+def usage
+    STDERR.puts $opt_parser.help()
+end
+
+# Print a message iff debug is enabled
+def dputs(str)
+    if $debug
+        puts str
+    end
+end
+
+# Pretty-print a number in both hex and decimal formats
+def prettynum(number)
+    dec = number.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
+    hex = number.to_s(16).reverse.gsub(/(\h{4})(?=\h)/, '\\1_').reverse
+    return '0x' + hex + "(" + dec + ")"
+end
+
+
+
+class RomBuilder
+
+    def initialize
+        @name = nil
+        @size = nil
+        @fill = 0x00
+        @fd = nil
+    end
+
+    ###############
+    # Methods for parsing the config file
+    ###############
+
+    # Specify information related to the output file.
+    # Parameters provided via hash.
+    def output(h)
+        # Set variables based on hash data
+        h.each do |k,v|
+            varname = '@' + k.to_s
+            if instance_variable_defined?(varname)
+                instance_variable_set(varname, v)
+            else
+                STDERR.puts "Unrecognized 'output' parameter: " + k.to_s
+            end
+        end
+
+        # Ensure that required parameters were specified
+        if @name.nil?
+            errout "No output filename specified", $err_syntax
+        #elsif File.file?(@name)
+        #    errout "Output file " + @name + " already exists.", $err_io
+        end
+        if @size.nil?
+            errout "No output file size specified", $err_syntax
+        elsif !@size.is_a?(Numeric) or @size < 1
+            errout "Invalid output size specified", $err_syntax
+        end
+
+        # Fill value can only be a single byte
+        @fill = @fill & 0xff
+    end
+
+    # Process the binary layout commands.
+    # Commands passed as a block.
+    def layout(&blk)
+        # Create base output file
+        @fd = File.open(@name, File::RDWR | File::BINARY | File::CREAT | File::TRUNC)
+        # this is inefficient for large files, optimize by building
+        # larger blocks (1KiB maybe) in memory and writing that out
+        # as a chunk.
+        @size.times { @fd.putc @fill }
+        @fd.rewind
+
+        begin
+            # Run user-specified commands
+            yield
+        rescue Exception => error
+            # Delete output file if unsuccessful
+            @fd.close
+            File.unlink(@name)
+
+            # Pass exception up the stack
+            raise error
+        ensure
+            # Clean up
+            @fd.close unless @fd.closed?
+        end
+    end
+
+
+    private
+    ###############
+    # Commands understood by this script
+    ###############
+
+    def component(file, offset, *args)
+        # Parse any optional arguments
+        size = 0
+        checksum = false
+        if not args.empty? and args[0].is_a? Numeric
+            size = args.shift
+            errout "Invalid size for component '#{file}'", $err_syntax if size < 1
+        end
+        if not args.empty? and args[0].is_a? Hash
+            optargs = args.shift
+            if optargs.include?(:checksum)
+                checksum = optargs.delete(:checksum)
+            end
+            unless optargs.empty?
+                if $debug
+                    STDERR.puts "Unknown options to 'component': #{optargs}"
+                end
+            end
+        end
+        unless args.empty?
+            errout "Bad syntax for 'component' directive", $err_syntax
+            # TBD: Show usage details
+        end
+        unless File.file?(file)
+            errout "Input file '#{file}' not found", $err_io
+        end
+
+        # Check memory ranges
+        errout "Invalid offset for component '#{file}'", $err_syntax if offset < 0
+        if (offset + size) > @size
+            errout "'component' directive for #{file} extends beyond end of file", $err_syntax
+        end
+        if (size > 0)
+            actual_size = File.size(file)
+            if (File.size(file) > (checksum ? size - 1 : size))
+                errout "component #{file} is larger than the specified size", $err_syntax
+            end
+        elsif size == 0
+            size = File.size(file)
+        end
+
+        dputs "Placing component '" + file + "' at offset #{prettynum(offset)}B"
+
+        # Copy input data to output file
+        @fd.seek(offset, IO::SEEK_SET)
+        @fd.write(IO.read(file, mode: "rb"))
+
+        # Perform optional checksumming
+        if checksum
+            checksum(offset, size)
+        end
+    end
+
+    # Calculate a single-byte, sum-to-zero checksum
+    # over a range of bytes.  The result will be written
+    # to the last byte of the specified range.
+    def checksum(offset, length)
+        dputs "Computing checksum: offset=#{prettynum(offset)}, length=#{prettynum(length)}"
+        # Check input params
+        errout "Invalid checksum offset: #{offset}", $err_syntax if offset < 0
+        errout "Invalid checksum length: #{length}", $err_syntax if length < 2
+        if offset > @size
+            errout "Offset #{offset} for chechsum is beyond end of file", $err_syntax
+        end
+
+        # Calculate checksum
+        @fd.seek(offset, IO::SEEK_SET)
+        sum = 0x100 - (@fd.read(length-1).sum(8) & 0xff)
+
+        # Write checksum to file
+        @fd.seek(offset + (length - 1), IO::SEEK_SET)
+        @fd.putc(sum)
+    end
+
+    # Write a specific value to a specific offset.
+    def setbyte(offset, value)
+        dputs "Setting byte at offset #{prettynum(offset)} to #{"0x%02x" % value}"
+        if offset > @size
+            errout "Offset #{offset} for 'setbyte' is beyond end of file", $err_syntax
+        end
+        @fd.seek(offset, IO::SEEK_SET)
+        @fd.putc value
+    end
+
+    # Do nothing.
+    # This command merely exists to allow users to explicitly
+    # label reserved space for readability purposes.
+    def reserved(*args)
+        dputs "Reserved entry found. Args: " +  args.to_s
+    end
+
+end
+
+
+###############
+# Main script body
+###############
+
+# Parse command-line arguments
+$opt_parser = OptionParser.new do |opts|
+    opts.banner = "Usage: layout [options] inputfile"
+
+    opts.on("-v", "--verbose", "Generate lots of debug output") do |v|
+        $debug = true
+    end
+    opts.on_tail("-h", "--help", "Show this message") do
+        puts opts
+        exit
+    end
+end
+$opt_parser.parse!
+
+# Extract input file name
+errout "No input file given", $err_cli if ARGV.empty?
+errout "Only one non-option argument may be provided", $err_cli if ARGV.length > 1
+infile = ARGV.shift
+unless File.exist?(infile)
+    errout "Input file " + infile + " does not exist.", $err_cli
+end
+
+# Read input file contents
+contents = File.read(infile)
+
+# Execute user instructions
+rb = RomBuilder.new
+rb.instance_eval(contents)
